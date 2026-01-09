@@ -98,7 +98,35 @@ public class LocksmithPdfPlugin: NSObject, FlutterPlugin {
             }
         }
 
-        guard let data = document.dataRepresentation() else {
+        // 方法：创建全新的文档并复制页面
+        // 这是最彻底的移除加密信息的方法
+        let newDocument = PDFDocument()
+
+        for i in 0..<document.pageCount {
+            if let page = document.page(at: i) {
+                newDocument.insert(page, at: i)
+            }
+        }
+
+        // 如果输出文件已存在，先删除
+        if FileManager.default.fileExists(atPath: outputPath) {
+            do {
+                try FileManager.default.removeItem(at: outputUrl)
+            } catch {
+                // 忽略删除错误，write可能会覆盖
+            }
+        }
+
+        // 尝试写入新文档
+        if newDocument.write(to: outputUrl) {
+            if FileManager.default.fileExists(atPath: outputPath) {
+                result(true)
+                return
+            }
+        }
+
+        // 备选方案：尝试使用 dataRepresentation
+        guard let data = newDocument.dataRepresentation() else {
             result(FlutterError(code: "DECRYPTION_FAILED", message: "Failed to create decrypted PDF data", details: nil))
             return
         }
@@ -144,14 +172,53 @@ public class LocksmithPdfPlugin: NSObject, FlutterPlugin {
         let inputUrl = URL(fileURLWithPath: inputPath)
         let outputUrl = URL(fileURLWithPath: outputPath)
 
-        guard let document = PDFDocument(url: inputUrl) else {
-            result(FlutterError(code: "LOAD_FAILED", message: "Could not load PDF", details: nil))
+        // 验证输入文件是否存在
+        guard FileManager.default.fileExists(atPath: inputPath) else {
+            result(FlutterError(code: "FILE_NOT_FOUND", message: "Input file does not exist: \(inputPath)", details: nil))
             return
         }
 
-        if document.isEncrypted {
-            result(FlutterError(code: "ALREADY_ENCRYPTED", message: "Input PDF is already encrypted. Cannot re-encrypt.", details: nil))
+        // 验证输入文件可读
+        guard FileManager.default.isReadableFile(atPath: inputPath) else {
+            result(FlutterError(code: "FILE_NOT_READABLE", message: "Input file is not readable: \(inputPath)", details: nil))
             return
+        }
+
+        // 确保输出目录存在
+        let outputDir = outputUrl.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true, attributes: nil)
+        } catch {
+            result(FlutterError(code: "CREATE_DIRECTORY_FAILED", message: "Failed to create output directory", details: error.localizedDescription))
+            return
+        }
+
+        // 加载PDF文档
+        guard let document = PDFDocument(url: inputUrl) else {
+            result(FlutterError(code: "LOAD_FAILED", message: "Could not load PDF from: \(inputPath)", details: nil))
+            return
+        }
+
+        // 如果文档已加密，尝试解锁
+        // 注意：如果要重新加密一个已加密的文档，必须先解锁
+        if document.isEncrypted {
+            // 尝试使用空密码解锁（某些PDF可能标记为加密但实际未加密）
+            var unlocked = document.unlock(withPassword: "")
+
+            // 如果空密码不行，尝试使用提供的用户密码
+            if !unlocked {
+                unlocked = document.unlock(withPassword: userPassword)
+            }
+
+            // 如果还是不行，尝试使用所有者密码
+            if !unlocked {
+                unlocked = document.unlock(withPassword: ownerPassword)
+            }
+
+            if !unlocked {
+                result(FlutterError(code: "ALREADY_ENCRYPTED", message: "Input PDF is already encrypted and cannot be unlocked with provided passwords. Cannot re-encrypt.", details: nil))
+                return
+            }
         }
 
         guard document.pageCount > 0 else {
@@ -159,26 +226,81 @@ public class LocksmithPdfPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        let options: [String: Any] = [
-            kCGPDFContextUserPassword as String: userPassword,
-            kCGPDFContextOwnerPassword as String: ownerPassword,
-            kCGPDFContextEncryptionKeyLength as String: 256,
-            kCGPDFContextAllowsPrinting as String: permissions.contains("print"),
-            kCGPDFContextAllowsCopying as String: permissions.contains("copy"),
-            kCGPDFContextAllowsEditing as String: permissions.contains("modify"),
-            kCGPDFContextAllowsCommenting as String: permissions.contains("annotate"),
-            kCGPDFContextAllowsFillingForms as String: permissions.contains("fillForms")
+        // 首先尝试不使用任何选项生成数据，确保文档本身可以生成数据表示
+        guard document.dataRepresentation() != nil else {
+            result(FlutterError(code: "INVALID_PDF", message: "PDF document cannot generate data representation. The PDF may be corrupted.", details: nil))
+            return
+        }
+
+        // 方法1：尝试使用 PDFDocument.write(to:withOptions:)
+        // 这是iOS 11.0+提供的最高级API
+        var writeOptions: [PDFDocumentWriteOption: Any] = [
+            .userPasswordOption: userPassword,
+            .ownerPasswordOption: ownerPassword
         ]
 
-        if let protectedData = document.dataRepresentation(options: options) {
-            do {
-                try protectedData.write(to: outputUrl)
+        // 尝试写入
+        if document.write(to: outputUrl, withOptions: writeOptions) {
+            // 验证文件是否创建
+            if FileManager.default.fileExists(atPath: outputPath) {
                 result(true)
-            } catch {
-                result(FlutterError(code: "WRITE_FAILED", message: "Failed to save encrypted PDF", details: error.localizedDescription))
+                return
             }
+        }
+
+        // 方法2：使用 dataRepresentation(options:)
+        // 构建加密选项
+        var options: [String: Any] = [
+            kCGPDFContextUserPassword as String: userPassword,
+            kCGPDFContextOwnerPassword as String: ownerPassword,
+            kCGPDFContextEncryptionKeyLength as String: 256
+        ]
+
+        // 添加权限选项
+        if permissions.isEmpty {
+            options[kCGPDFContextAllowsPrinting as String] = true
+            options[kCGPDFContextAllowsCopying as String] = true
         } else {
-            result(FlutterError(code: "ENCRYPTION_FAILED", message: "Failed to generate encrypted PDF data.", details: nil))
+            options[kCGPDFContextAllowsPrinting as String] = permissions.contains("print")
+            options[kCGPDFContextAllowsCopying as String] = permissions.contains("copy")
+        }
+
+        // 尝试生成加密数据
+        var protectedData: Data? = document.dataRepresentation(options: options)
+
+        // 如果失败，尝试不使用权限选项（只使用密码）
+        if protectedData == nil {
+            var simpleOptions: [String: Any] = [
+                kCGPDFContextUserPassword as String: userPassword,
+                kCGPDFContextOwnerPassword as String: ownerPassword,
+                kCGPDFContextEncryptionKeyLength as String: 256
+            ]
+            protectedData = document.dataRepresentation(options: simpleOptions)
+        }
+
+        guard let finalData = protectedData else {
+            result(FlutterError(code: "ENCRYPTION_FAILED", message: "Failed to generate encrypted PDF data with all attempted options. Input file: \(inputPath), Output file: \(outputPath). Document page count: \(document.pageCount), Is encrypted: \(document.isEncrypted)", details: nil))
+            return
+        }
+
+        // 写入加密的PDF文件
+        do {
+            // 如果输出文件已存在，先删除
+            if FileManager.default.fileExists(atPath: outputPath) {
+                try FileManager.default.removeItem(at: outputUrl)
+            }
+
+            try finalData.write(to: outputUrl)
+
+            // 验证输出文件是否成功创建
+            guard FileManager.default.fileExists(atPath: outputPath) else {
+                result(FlutterError(code: "WRITE_FAILED", message: "Output file was not created after write operation", details: nil))
+                return
+            }
+
+            result(true)
+        } catch {
+            result(FlutterError(code: "WRITE_FAILED", message: "Failed to save encrypted PDF: \(error.localizedDescription)", details: error.localizedDescription))
         }
     }
 }
